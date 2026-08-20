@@ -1361,25 +1361,27 @@ async function handleSignup(e){
   const password = document.getElementById('su-password').value;
   const confirm = document.getElementById('su-confirm').value;
   if(password !== confirm){ showToast('Passwords do not match','⚠️'); return false; }
-  if(password.length < 6){ showToast('Password should be at least 6 characters','⚠️'); return false; }
-  const existing = await storeGet('user:'+email, true);
-  if(existing){ showToast('An account already exists for that email — please sign in','⚠️'); openSignInModal('login'); return false; }
-  const passwordHash = await hashPassword(password);
-  const user = {name, email, passwordHash, provider:'email', joined:new Date().toISOString(), picture:null};
-  await storeSet('user:'+email, user, true);
-  await finishSignIn(user);
+  if(password.length < 8){ showToast('Password should be at least 8 characters','⚠️'); return false; }
+  try{
+    const { token, user } = await API.signup(name, email, password);
+    setAuthToken(token);
+    await finishSignIn(user);
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
   return false;
 }
 async function handleLogin(e){
   e.preventDefault();
   const email = document.getElementById('li-email').value.trim().toLowerCase();
   const password = document.getElementById('li-password').value;
-  const user = await storeGet('user:'+email, true);
-  if(!user){ showToast('No account found with that email — try creating one','⚠️'); return false; }
-  if(!user.passwordHash){ showToast('This account uses Google Sign-In — please continue with Google','⚠️'); return false; }
-  const hash = await hashPassword(password);
-  if(hash !== user.passwordHash){ showToast('Incorrect password','⚠️'); return false; }
-  await finishSignIn(user);
+  try{
+    const { token, user } = await API.login(email, password);
+    setAuthToken(token);
+    await finishSignIn(user);
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
   return false;
 }
 async function mockGoogleSignIn(){
