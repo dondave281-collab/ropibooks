@@ -795,24 +795,24 @@ async function storeListKeys(prefix, shared){
 
 /* ---------- Data bootstrap ---------- */
 async function initData(){
-  let books = await storeGet('catalog:books', true);
-  const savedVersion = await storeGet('catalog:version', true);
-
-  if(!books || !books.length || savedVersion !== CATALOG_VERSION){
-    // Preserve any books the admin added/edited manually (ids not in DEFAULT_BOOKS)
-    const defaultIds = new Set(DEFAULT_BOOKS.map(b=>b.id));
-    const customBooks = (books||[]).filter(b=>!defaultIds.has(b.id));
-    books = [...DEFAULT_BOOKS, ...customBooks];
-    await storeSet('catalog:books', books, true);
-    await storeSet('catalog:version', CATALOG_VERSION, true);
+  try{
+    const { books } = await API.listBooks();
+    STATE.books = books;
+  }catch(err){
+    STATE.books = [];
+    showToast('Could not load books', '⚠️');
   }
-  STATE.books = books;
 
   // session (personal, not shared) - keep user logged in on this device
-  const session = await storeGet('session:current', false);
-  if(session && session.email){
-    STATE.user = session;
-    await loadLibrary();
+    // session (personal, not shared) - keep user logged in on this device
+  if(authToken()){
+    try{
+      const { user } = await API.session();
+      STATE.user = user;
+      await loadLibrary();
+    }catch(err){
+      setAuthToken(null); // stale/expired token, clear it
+    }
   }
 }
 
@@ -1920,27 +1920,31 @@ async function saveBookForm(e, bookId){
   const stock = Number(document.getElementById('bf-stock').value)||0;
   const releaseDate = document.getElementById('bf-release').value;
   const featured = document.getElementById('bf-featured').checked;
-  const cover = window._newCoverData || 'data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="260"><rect width="100%" height="100%" fill="%23eee"/></svg>');
+  const cover = window._newCoverData || 'data:image/svg+xml;base64,'+btoa('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="260"><rect width="200" height="260" fill="%23eee"/></svg>');
 
-  if(bookId){
-    const b = STATE.books.find(x=>x.id===bookId);
-    Object.assign(b, {title,subtitle,category,pages,description,hasDigital,hasPhysical,priceDigital,pricePhysical,stock,releaseDate,featured,cover});
-  } else {
-    STATE.books.push({ id:uid('bk'), title,subtitle,category,pages,description,hasDigital,hasPhysical,priceDigital,pricePhysical,stock,releaseDate,featured,cover });
-  }
-  await storeSet('catalog:books', STATE.books, true);
+const id = bookId || uid('bk');
+try{
+  await API.upsertBook({ id, title, category, description, hasDigital, hasPhysical, priceDigital, pricePhysical, stock, featured, cover });
+  const { books } = await API.listBooks();
+  STATE.books = books;
   closeModal();
   showToast(bookId?'Book updated':'Book added');
   loadAdminPage();
-  return false;
+}catch(err){
+  showToast(err.message, '⚠️');
 }
+return false;
 async function deleteBook(bookId){
   if(!confirm('Delete this book permanently?')) return;
-  STATE.books = STATE.books.filter(b=>b.id!==bookId);
-  await storeSet('catalog:books', STATE.books, true);
-  await storeDelete('pdf:'+bookId, true);
-  showToast('Book deleted');
-  loadAdminPage();
+  try{
+    await fetch('/api/books/delete', { method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+adminToken()}, body: JSON.stringify({ id: bookId }) });
+    const { books } = await API.listBooks();
+    STATE.books = books;
+    showToast('Book deleted');
+    loadAdminPage();
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
 }
 function uploadPdfPrompt(bookId){
   const b = STATE.books.find(x=>x.id===bookId);
