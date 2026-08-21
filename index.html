@@ -580,7 +580,6 @@ const IMG_hero_bg = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAcF
    ============================================================ */
 
 /* ---------- Config ---------- */
-const ADMIN_PASSCODE = "RestorersOfPaths2026"; // change before going live
 const CONTACT = { phone1:"0556 834 950", phone2:"0558 434 736", email:"2019restorersofpaths@gmail.com" };
 
 // Paystack public key — replace with your real key from https://dashboard.paystack.com/#/settings/developers
@@ -1774,14 +1773,23 @@ function renderAdmin(){
 function adminNavLink(page,label){
   return `<a class="${STATE.adminPage===page?'active':''}" onclick="setAdminPage('${page}')" href="#">${label}</a>`;
 }
-function adminLogin(e){
+async function adminLogin(e){
   e.preventDefault();
   const val = document.getElementById('admin-pass').value;
-  if(val === ADMIN_PASSCODE){ STATE.adminAuthed = true; STATE.adminPage='overview'; render(); loadAdminPage(); showToast('Welcome back, Admin'); }
-  else { showToast('Incorrect passcode', '⚠️'); }
+  try{
+    const { token } = await API.adminLogin('admin', val);
+    setAdminToken(token);
+    STATE.adminAuthed = true;
+    STATE.adminPage = 'overview';
+    render();
+    loadAdminPage();
+    showToast('Welcome back, Admin');
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
   return false;
 }
-function adminLogout(){ STATE.adminAuthed=false; render(); }
+function adminLogout(){ setAdminToken(null); STATE.adminAuthed=false; render(); }
 function setAdminPage(p){ STATE.adminPage=p; render(); loadAdminPage(); }
 
 async function loadAdminPage(){
