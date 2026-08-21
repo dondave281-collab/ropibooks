@@ -1805,10 +1805,10 @@ async function loadAdminPage(){
 }
 
 async function renderAdminOverview(main){
-  const orders = await getAllOrders();
-  const users = await getAllUsers();
-  const subs = await getSubscribers();
-  const revenue = orders.filter(o=>o.status!=='pending'||o.paymentMethod==='cod').reduce((s,o)=>s+o.total,0);
+  const { orders } = await API.listOrders();
+  const { users } = await API.adminUsers();
+  const { subscribers: subs } = await API.listSubscribers();
+  const revenue = orders.filter(o=>o.status!=='pending'||o.payment_method==='cod').reduce((s,o)=>s+o.total,0);
   main.innerHTML = `
     <h2 style="font-size:26px;margin-bottom:24px;">Dashboard Overview</h2>
     <div class="stat-cards">
@@ -1820,7 +1820,7 @@ async function renderAdminOverview(main){
     <div class="admin-panel">
       <h3>Recent Orders</h3>
       ${orders.length? `<table><thead><tr><th>Order</th><th>Customer</th><th>Total</th><th>Status</th><th>Date</th></tr></thead><tbody>
-        ${orders.slice(0,6).map(o=>`<tr><td>${o.id}</td><td>${escapeHtml(o.userName)}</td><td>${fmtGHS(o.total)}</td><td><span class="status-tag status-${o.status}">${o.status}</span></td><td>${new Date(o.createdAt).toLocaleDateString()}</td></tr>`).join('')}
+        ${orders.slice(0,6).map(o=>`<tr><td>${o.id}</td><td>${escapeHtml(o.user_name)}</td><td>${fmtGHS(o.total)}</td><td><span class="status-tag status-${o.status}">${o.status}</span></td><td>${new Date(o.createdAt).toLocaleDateString()}</td></tr>`).join('')}
       </tbody></table>` : '<p>No orders yet.</p>'}
     </div>
     <div class="notice">This dashboard uses the site's built-in secure storage. For a production launch, connect a real database, payment gateway (e.g. Paystack/Hubtel for Mobile Money and cards), and Google OAuth — details are in my message below the site.</div>
