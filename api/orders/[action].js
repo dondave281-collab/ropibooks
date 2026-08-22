@@ -1,5 +1,6 @@
 const crypto = require('crypto');
 const db = require('../_lib/supabase');
+const { notifyAdmin } = require('../_lib/mailer');
 const { ok, fail, requireUser, requireAdmin, withHandler } = require('../_lib/util');
 
 module.exports = withHandler(async (req, res) => {
@@ -39,6 +40,12 @@ module.exports = withHandler(async (req, res) => {
       order_ref: orderRef, user_id: user.id, user_email: user.email, user_name: user.name,
       items: orderItems, total, payment_method: paymentMethod, status: 'pending', delivery,
     });
+
+    const itemsSummary = orderItems.map(i => `- ${i.title} (${i.format}) x${i.qty} — GHS ${i.price * i.qty}`).join('\n');
+    notifyAdmin(
+      `New order ${orderRef} — Restorers of Paths`,
+      `A new order was placed.\n\nOrder ref: ${orderRef}\nCustomer: ${user.name} (${user.email})\nPayment method: ${paymentMethod}\nTotal: GHS ${total}\n\nItems:\n${itemsSummary}${delivery ? `\n\nDelivery:\n${delivery.name}, ${delivery.phone}\n${delivery.address}, ${delivery.city}` : ''}`
+    );
 
     if (paymentMethod !== 'paystack') return ok(res, { order });
 
