@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Rev. Ruthanna Ankomah Tanor | Restorers of Paths</title>
-<script src="https://js.paystack.co/v1/inline.js"></script>
+<script src="https://js.paystack.co/v2/inline.js"></script>
 <script src="api.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,500&family=Mulish:wght@400;500;600;700;800&display=swap');
@@ -1468,9 +1468,9 @@ function checkoutModalHtml(hasPhysical, hasDigital){
     <button class="btn btn-wine btn-block" onclick="submitCheckout(${hasPhysical})">Continue</button>
   `;
 }
-function submitCheckout(hasPhysical){
+async function submitCheckout(hasPhysical){
   const payMethod = document.querySelector('input[name=pay]:checked')?.value || 'paystack';
-  let deliveryInfo = {};
+  let deliveryInfo = null;
   if(hasPhysical){
     const name = document.getElementById('co-name').value.trim();
     const phone = document.getElementById('co-phone')?.value.trim();
@@ -1481,13 +1481,8 @@ function submitCheckout(hasPhysical){
     }
     deliveryInfo = {name,phone,city,address};
   }
-  if(payMethod === 'cod'){
-    processCod(deliveryInfo);
-  } else {
-    launchPaystack(deliveryInfo);
-  }
-}
-function processCod(deliveryInfo){
+  const items = STATE.cart.map(c=>({ bookId:c.bookId, format:c.format, qty:c.qty||1 }));
+
   openModal(`
     <div style="text-align:center;padding:30px 0;">
       <div style="width:56px;height:56px;border:4px solid var(--line);border-top-color:var(--gold);border-radius:50%;margin:0 auto 20px;animation:spin 0.9s linear infinite;"></div>
@@ -1496,89 +1491,77 @@ function processCod(deliveryInfo){
     </div>
     <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
   `, 'modal-lg');
-  setTimeout(async ()=>{ await finalizeOrder('cod', deliveryInfo); }, 1000);
+
+  try{
+    const result = await API.createOrder(items, deliveryInfo, payMethod);
+    if(payMethod === 'cod'){
+      showOrderSuccess(result.order);
+    } else {
+      launchPaystack(result);
+    }
+  }catch(err){
+    closeModal();
+    showToast(err.message, '⚠️');
+  }
 }
 
-/* ---------- Paystack (real inline checkout — needs a live public key) ---------- */
-function launchPaystack(deliveryInfo){
+function launchPaystack(result){
   if(typeof PaystackPop === 'undefined'){
+    closeModal();
     showToast('Payment system could not load — check your connection and try again', '⚠️');
     return;
   }
-  if(PAYSTACK_PUBLIC_KEY.includes('00000000')){
-    showToast('Add your real Paystack public key in the code to accept live payments', '⚠️');
-  }
-  const amountInPesewas = Math.round(cartTotal()*100); // Paystack expects the smallest currency unit
-  const reference = 'RP-' + Date.now() + '-' + Math.floor(Math.random()*100000);
   closeModal();
-  const handler = PaystackPop.setup({
-    key: PAYSTACK_PUBLIC_KEY,
-    email: STATE.user.email,
-    amount: amountInPesewas,
-    currency: 'GHS',
-    ref: reference,
-    channels: ['card','mobile_money'],
-    metadata: {
-      custom_fields: [{ display_name: "Customer", variable_name: "customer_name", value: STATE.user.name }]
-    },
-    callback: function(response){
-      finalizeOrder('paystack', deliveryInfo, response.reference);
-    },
-    onClose: function(){
-      showToast('Payment window closed — your order was not completed', '⚠️');
-    }
+  const popup = new PaystackPop();
+  popup.resumeTransaction(result.access_code, {
+    onSuccess: () => { pollOrderPaid(result.order.order_ref); },
+    onCancel: () => { showToast('Payment window closed — your order was not completed', '⚠️'); },
+    onError: (error) => { showToast('Payment error: ' + (error?.message||'please try again'), '⚠️'); }
   });
-  handler.openIframe();
 }
 
-async function finalizeOrder(method, deliveryInfo, paystackRef){
-  const items = STATE.cart.map(c=>{
-    const b = STATE.books.find(x=>x.id===c.bookId);
-    return { bookId:c.bookId, title:b.title, format:c.format, qty:c.qty||1, price:c.format==='digital'?b.priceDigital:b.pricePhysical };
-  });
-  const orderId = uid('ORD');
-  const status = method==='cod' ? 'pending' : 'paid';
-  const order = {
-    id: orderId,
-    userEmail: STATE.user.email,
-    userName: STATE.user.name,
-    items,
-    total: items.reduce((s,i)=>s+i.price*i.qty,0),
-    paymentMethod: method,
-    paystackRef: paystackRef || null,
-    status,
-    delivery: deliveryInfo,
-    createdAt: new Date().toISOString()
-  };
-  await storeSet('order:'+orderId, order, true);
-
-  // unlock digital items immediately once paid
-  const digitalItems = items.filter(i=>i.format==='digital');
-  if(digitalItems.length && status==='paid'){
-    for(const di of digitalItems){
-      if(!STATE.library.some(l=>l.bookId===di.bookId)){
-        STATE.library.push({bookId:di.bookId, purchasedAt:new Date().toISOString(), orderId});
-      }
+async function pollOrderPaid(orderRef, attempt){
+  attempt = attempt || 0;
+  openModal(`
+    <div style="text-align:center;padding:30px 0;">
+      <div style="width:56px;height:56px;border:4px solid var(--line);border-top-color:var(--gold);border-radius:50%;margin:0 auto 20px;animation:spin 0.9s linear infinite;"></div>
+      <h3 style="font-size:18px;">Confirming your payment...</h3>
+      <p style="font-size:13px;">This usually takes a few seconds.</p>
+    </div>
+    <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
+  `, 'modal-lg');
+  try{
+    const { order } = await API.verifyOrder(orderRef);
+    if(order.status === 'paid'){
+      await loadLibrary();
+      showOrderSuccess(order);
+      return;
     }
-    await saveLibrary();
+  }catch(err){}
+  if(attempt < 8){
+    setTimeout(()=>pollOrderPaid(orderRef, attempt+1), 2000);
+  } else {
+    closeModal();
+    showToast('We are still confirming your payment — check "My Orders" shortly.', '⚠️');
   }
+}
 
+function showOrderSuccess(order){
   STATE.cart = [];
   updateCartBadge();
-
+  const hasDigitalItems = order.items.some(i=>i.format==='digital') && order.status==='paid';
   openModal(`
     <button class="modal-close" onclick="closeModal()">${xIcon()}</button>
     <div class="success-box">
       <div class="check-circle">${checkIcon()}</div>
-      <h2>${status==='pending' ? 'Order Placed!' : 'Payment Successful!'}</h2>
-      <p>Order <strong>${orderId}</strong> ${status==='pending'?'will be delivered and paid for on arrival.':'has been recorded.'} ${digitalItems.length?'Your digital books are now available in My Library.':''}</p>
+      <h2>${order.status==='pending' ? 'Order Placed!' : 'Payment Successful!'}</h2>
+      <p>Order <strong>${order.order_ref}</strong> ${order.status==='pending'?'will be delivered and paid for on arrival.':'has been recorded.'} ${hasDigitalItems?'Your digital books are now available in My Library.':''}</p>
       <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">
-        ${digitalItems.length?`<button class="btn btn-navy" onclick="closeModal();go('library')">Go to My Library</button>`:`<button class="btn btn-navy" onclick="closeModal();go('shop')">Continue Shopping</button>`}
+        ${hasDigitalItems?`<button class="btn btn-navy" onclick="closeModal();go('library')">Go to My Library</button>`:`<button class="btn btn-navy" onclick="closeModal();go('shop')">Continue Shopping</button>`}
       </div>
     </div>
   `, 'modal-lg');
 }
-
 /* ============================================================
    LIBRARY / READER
    ============================================================ */
