@@ -1,5 +1,6 @@
 const bcrypt = require('bcryptjs');
 const db = require('../_lib/supabase');
+const { notifyAdmin } = require('../_lib/mailer');
 const { ok, fail, generateToken, hashToken, clientIp, validEmail, requireUser, tooManyAttempts, recordAttempt, withHandler } = require('../_lib/util');
 
 // Public — safe to be in source, this is not a secret.
@@ -31,6 +32,12 @@ module.exports = withHandler(async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 10);
     const user = await db.insert('users', { name: cleanName, email: cleanEmail, password_hash: passwordHash, provider: 'email' });
     const session = await makeSession(user, res);
+
+    notifyAdmin(
+      'New signup — Restorers of Paths',
+      `A new user just signed up.\n\nName: ${cleanName}\nEmail: ${cleanEmail}\nMethod: Email/Password\nTime: ${new Date().toISOString()}`
+    );
+
     return ok(res, session);
   }
 
@@ -78,12 +85,21 @@ module.exports = withHandler(async (req, res) => {
 
     let rows = await db.select('users', `email=eq.${encodeURIComponent(cleanEmail)}&select=*`);
     let user = rows[0];
+    let isNewUser = false;
 
     if (!user) {
       user = await db.insert('users', { name, email: cleanEmail, password_hash: null, provider: 'google', google_id: googleId });
+      isNewUser = true;
     } else if (!user.google_id) {
       const updated = await db.update('users', `id=eq.${user.id}`, { google_id: googleId });
       user = updated[0] || user;
+    }
+
+    if (isNewUser) {
+      notifyAdmin(
+        'New signup — Restorers of Paths',
+        `A new user just signed up.\n\nName: ${name}\nEmail: ${cleanEmail}\nMethod: Google Sign-In\nTime: ${new Date().toISOString()}`
+      );
     }
 
     const session = await makeSession(user, res);
