@@ -14,18 +14,24 @@ module.exports = withHandler(async (req, res) => {
 
     const bookIds = items.map((i) => String(i.bookId || ''));
     const idsFilter = `id=in.(${bookIds.map(encodeURIComponent).join(',')})`;
-    const books = await db.select('books', `${idsFilter}&select=id,title,price,format`);
+    const books = await db.select('books', `${idsFilter}&select=id,title,price_digital,price_physical,has_digital,has_physical`);
     const booksById = Object.fromEntries(books.map((b) => [b.id, b]));
 
     let total = 0;
     const orderItems = [];
     for (const item of items) {
       const bookId = String(item.bookId || '');
+      const format = item.format === 'physical' ? 'physical' : 'digital';
       const qty = Math.max(1, parseInt(item.qty || 1, 10));
       const book = booksById[bookId];
       if (!book) return fail(res, 422, `Unknown book: ${bookId}`);
-      total += book.price * qty;
-      orderItems.push({ bookId, title: book.title, format: book.format, price: book.price, qty });
+
+      if (format === 'digital' && !book.has_digital) return fail(res, 422, `${book.title} is not available digitally.`);
+      if (format === 'physical' && !book.has_physical) return fail(res, 422, `${book.title} is not available physically.`);
+
+      const price = format === 'digital' ? Number(book.price_digital || 0) : Number(book.price_physical || 0);
+      total += price * qty;
+      orderItems.push({ bookId, title: book.title, format, price, qty });
     }
 
     const orderRef = 'ROP-' + crypto.randomBytes(5).toString('hex').toUpperCase();
