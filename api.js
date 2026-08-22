@@ -75,6 +75,7 @@ const API = {
   createOrder: (items, delivery, paymentMethod) =>
     api('/api/orders/create', { method: 'POST', body: { items, delivery, paymentMethod } }),
   verifyOrder: (reference) => api(`/api/orders/verify?reference=${encodeURIComponent(reference)}`),
+  myOrders: () => api('/api/orders/mine'),
   listOrders: () => api('/api/orders/list', { admin: true }),
   updateOrderStatus: (orderId, status) =>
     api('/api/orders/update-status', { method: 'POST', body: { orderId, status }, admin: true }),
