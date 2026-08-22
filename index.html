@@ -1324,15 +1324,14 @@ async function hashPassword(password){
 
 function openSignInModal(tab){
   openModal(authModalHtml(tab||'login'));
+  setTimeout(renderGoogleButton, 0);
 }
 function authModalHtml(tab){
   return `
     <button class="modal-close" onclick="closeModal()">${xIcon()}</button>
     <h2>Welcome</h2>
     <div class="sub">Sign in or create a free account to purchase books, read your library, and track orders.</div>
-    <button class="google-btn" onclick="mockGoogleSignIn()">
-      ${googleIcon()} Continue with Google
-    </button>
+    <div id="google-signin-btn" style="display:flex;justify-content:center;margin-bottom:10px;"></div>
     <div class="divider-or">or use your email</div>
     <div class="format-toggle" style="margin-bottom:18px;">
       <button type="button" class="${tab==='login'?'active':''}" onclick="openSignInModal('login')">Sign In<span>Already have an account</span></button>
@@ -1385,28 +1384,35 @@ async function handleLogin(e){
   }
   return false;
 }
-async function mockGoogleSignIn(){
-  // NOTE: Real Google Sign-In requires an OAuth Client ID from Google Cloud Console
-  // tied to this site's domain. Until that's set up, we ask the visitor for their
-  // own Google account details instead of assigning a random demo account.
-  const name = (prompt("Continue with Google\n\nEnter your name:") || "").trim();
-  if(!name){ return; }
-  let email = (prompt("Enter your Gmail address:") || "").trim().toLowerCase();
-  if(!email){ return; }
-  if(!/^[^\s@]+@gmail\.com$/.test(email)){
-    showToast('Please enter a valid Gmail address','⚠️');
-    return;
+const GOOGLE_CLIENT_ID = '796935578270-7g5p1s4l7lj8gqfpkismslr2rjh2kcub.apps.googleusercontent.com';
+let googleInitDone = false;
+
+function initGoogleSignIn(){
+  if(googleInitDone || typeof google === 'undefined') return;
+  google.accounts.id.initialize({ client_id: GOOGLE_CLIENT_ID, callback: handleGoogleCredential });
+  googleInitDone = true;
+}
+
+function renderGoogleButton(){
+  initGoogleSignIn();
+  const el = document.getElementById('google-signin-btn');
+  if(el && typeof google !== 'undefined'){
+    el.innerHTML = '';
+    google.accounts.id.renderButton(el, { theme:'outline', size:'large', width:280, text:'continue_with' });
   }
-  let user = await storeGet('user:'+email, true);
-  if(!user){
-    user = {name:name, email:email, provider:'google', passwordHash:null, joined:new Date().toISOString(), picture:null};
-    await storeSet('user:'+email, user, true);
+}
+
+async function handleGoogleCredential(response){
+  try{
+    const { token, user } = await API.googleSignIn(response.credential);
+    setAuthToken(token);
+    await finishSignIn(user);
+  }catch(err){
+    showToast(err.message, '⚠️');
   }
-  await finishSignIn(user);
 }
 async function finishSignIn(user){
   STATE.user = user;
-  await storeSet('session:current', user, false);
   await loadLibrary();
   closeModal();
   showToast('Signed in as '+user.name);
