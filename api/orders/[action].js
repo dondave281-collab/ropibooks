@@ -70,6 +70,14 @@ module.exports = withHandler(async (req, res) => {
     return ok(res, { order: rows[0] });
   }
 
+  // Customer-facing: only that user's own orders, no admin session required.
+  if (action === 'mine' && req.method === 'GET') {
+    const user = await requireUser(req, res);
+    if (!user) return;
+    const orders = await db.select('orders', `user_id=eq.${user.id}&select=id,order_ref,items,total,payment_method,status,created_at&order=created_at.desc`);
+    return ok(res, { orders });
+  }
+
   if (action === 'list' && req.method === 'GET') {
     const admin = await requireAdmin(req, res);
     if (!admin) return;
