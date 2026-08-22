@@ -1644,19 +1644,19 @@ async function loadOrdersIntoLib(){
   </tbody></table>`;
 }
 async function downloadPdf(bookId){
-  const pdf = await storeGet('pdf:'+bookId, true);
   const b = STATE.books.find(x=>x.id===bookId);
-  if(!pdf || !pdf.dataUrl){
-    showToast('PDF not yet uploaded by admin for this title', '⚠️');
-    return;
+  try{
+    const { url } = await API.pdfUrl(bookId);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (b?b.title:'book') + '.pdf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    showToast('Downloading PDF...');
+  }catch(err){
+    showToast(err.message, '⚠️');
   }
-  const a = document.createElement('a');
-  a.href = pdf.dataUrl;
-  a.download = (b?b.title:'book') + '.pdf';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  showToast('Downloading PDF...');
 }
 function renderReader(){
   const b = STATE.books.find(x=>x.id===STATE.readerBookId);
