@@ -1954,28 +1954,28 @@ function uploadPdfPrompt(bookId){
     <h2>Upload PDF</h2>
     <div class="sub">${escapeHtml(b.title)}</div>
     <div class="field">
-      <label>PDF File (max ~4MB for this demo storage)</label>
+      <label>PDF File (max ~4MB)</label>
       <input type="file" id="pdf-input" accept="application/pdf"/>
     </div>
     <div class="notice">The PDF is stored securely and only made available to customers after purchase, via the "Download PDF" button in their library.</div>
     <button class="btn btn-navy btn-block" onclick="handlePdfUpload('${bookId}')">Upload</button>
   `);
 }
-function handlePdfUpload(bookId){
+async function handlePdfUpload(bookId){
   const file = document.getElementById('pdf-input').files[0];
   if(!file){ showToast('Choose a PDF file first','⚠️'); return; }
-  if(file.size > 4.5*1024*1024){ showToast('File too large for demo storage (max ~4MB)','⚠️'); return; }
-  const reader = new FileReader();
-  reader.onload = async function(ev){
-    await storeSet('pdf:'+bookId, {dataUrl:ev.target.result, filename:file.name, uploadedAt:new Date().toISOString()}, true);
+  if(file.size > 4*1024*1024){ showToast('File too large (max ~4MB)','⚠️'); return; }
+  try{
+    await API.uploadPdf(bookId, file);
     closeModal();
     showToast('PDF uploaded successfully');
-  };
-  reader.readAsDataURL(file);
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
 }
 
 async function renderAdminOrders(main){
-  const orders = await getAllOrders();
+  const { orders } = await API.listOrders();
   main.innerHTML = `
     <h2 style="font-size:26px;margin-bottom:24px;">Orders & Payments</h2>
     <div class="admin-panel" style="padding:0;overflow-x:auto;">
@@ -1983,13 +1983,13 @@ async function renderAdminOrders(main){
         <thead><tr><th>Order</th><th>Customer</th><th>Items</th><th>Total</th><th>Payment</th><th>Status</th><th>Date</th><th>Update</th></tr></thead>
         <tbody>
           ${orders.length ? orders.map(o=>`<tr>
-            <td>${o.id}</td>
-            <td>${escapeHtml(o.userName)}<br/><span style="color:var(--ink-soft);font-size:11.5px;">${escapeHtml(o.userEmail)}</span></td>
+            <td>${o.order_ref}</td>
+            <td>${escapeHtml(o.user_name)}<br/><span style="color:var(--ink-soft);font-size:11.5px;">${escapeHtml(o.user_email)}</span></td>
             <td style="max-width:200px;">${o.items.map(i=>escapeHtml(i.title)+' ('+i.format+')').join(', ')}</td>
             <td>${fmtGHS(o.total)}</td>
-            <td>${o.paymentMethod.toUpperCase()}${o.delivery && o.delivery.phone ? '<br/><span style="font-size:11px;color:var(--ink-soft);">'+escapeHtml(o.delivery.phone)+'</span>':''}</td>
+            <td>${o.payment_method.toUpperCase()}${o.delivery && o.delivery.phone ? '<br/><span style="font-size:11px;color:var(--ink-soft);">'+escapeHtml(o.delivery.phone)+'</span>':''}</td>
             <td><span class="status-tag status-${o.status}">${o.status}</span></td>
-            <td>${new Date(o.createdAt).toLocaleDateString()}</td>
+            <td>${new Date(o.created_at).toLocaleDateString()}</td>
             <td>
               <select onchange="updateOrderStatus('${o.id}', this.value)" style="padding:6px;border-radius:4px;border:1px solid var(--line);font-size:12px;">
                 <option value="pending" ${o.status==='pending'?'selected':''}>Pending</option>
@@ -2004,37 +2004,28 @@ async function renderAdminOrders(main){
     </div>
   `;
 }
+  
 async function updateOrderStatus(orderId, status){
-  const order = await storeGet('order:'+orderId, true);
-  if(!order) return;
-  order.status = status;
-  await storeSet('order:'+orderId, order, true);
-  if(status==='paid'){
-    // unlock any digital items for that user in case they were pending
-    const digitalItems = order.items.filter(i=>i.format==='digital');
-    if(digitalItems.length){
-      const lib = await storeGet('userlib:'+order.userEmail, true) || [];
-      for(const di of digitalItems){
-        if(!lib.some(l=>l.bookId===di.bookId)) lib.push({bookId:di.bookId, purchasedAt:new Date().toISOString(), orderId});
-      }
-      await storeSet('userlib:'+order.userEmail, lib, true);
-    }
+  try{
+    await API.updateOrderStatus(orderId, status);
+    showToast('Order status updated');
+    loadAdminPage();
+  }catch(err){
+    showToast(err.message, '⚠️');
   }
-  showToast('Order status updated');
 }
-
 async function renderAdminUsers(main){
-  const users = await getAllUsers();
+  const { users } = await API.adminUsers();
   main.innerHTML = `
     <h2 style="font-size:26px;margin-bottom:24px;">Registered Users</h2>
     <div class="admin-panel" style="padding:0;overflow-x:auto;">
       <table><thead><tr><th>Name</th><th>Email</th><th>Joined</th></tr></thead><tbody>
-        ${users.length ? users.map(u=>`<tr><td>${escapeHtml(u.name)}</td><td>${escapeHtml(u.email)}</td><td>${new Date(u.joined).toLocaleDateString()}</td></tr>`).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--ink-soft);">No registered users yet.</td></tr>'}
+        ${users.length ? users.map(u=>`<tr><td>${escapeHtml(u.name)}</td><td>${escapeHtml(u.email)}</td><td>${new Date(u.created_at).toLocaleDateString()}</td></tr>`).join('') : '<tr><td colspan="3" style="text-align:center;color:var(--ink-soft);">No registered users yet.</td></tr>'}
       </tbody></table>
     </div>`;
 }
 async function renderAdminSubscribers(main){
-  const subs = await getSubscribers();
+  const { subscribers: subs } = await API.listSubscribers();
   main.innerHTML = `
     <div class="admin-toolbar"><h2 style="font-size:26px;">Newsletter Subscribers</h2>
     <button class="btn btn-ghost btn-sm" onclick="exportSubscribers()">Export CSV</button></div>
@@ -2045,7 +2036,7 @@ async function renderAdminSubscribers(main){
     </div>`;
 }
 async function exportSubscribers(){
-  const subs = await getSubscribers();
+  const { subscribers: subs } = await API.listSubscribers();
   const csv = 'Email\n'+subs.join('\n');
   const blob = new Blob([csv], {type:'text/csv'});
   const a = document.createElement('a');
@@ -2054,12 +2045,12 @@ async function exportSubscribers(){
   a.click();
 }
 async function renderAdminMessages(main){
-  const msgs = await getMessages();
+  const { messages: msgs } = await API.listMessages();
   main.innerHTML = `
     <h2 style="font-size:26px;margin-bottom:24px;">Contact Messages</h2>
     ${msgs.length ? msgs.slice().reverse().map(m=>`
       <div class="admin-panel">
-        <div style="display:flex;justify-content:space-between;"><strong>${escapeHtml(m.name)}</strong><span style="font-size:12px;color:var(--ink-soft);">${new Date(m.date).toLocaleString()}</span></div>
+        <div style="display:flex;justify-content:space-between;"><strong>${escapeHtml(m.name)}</strong><span style="font-size:12px;color:var(--ink-soft);">${new Date(m.created_at).toLocaleString()}</span></div>
         <div style="font-size:13px;color:var(--ink-soft);margin-bottom:8px;">${escapeHtml(m.email)}</div>
         <p style="margin:0;">${escapeHtml(m.message)}</p>
       </div>
