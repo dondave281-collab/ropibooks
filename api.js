@@ -56,6 +56,7 @@ const API = {
   signup: (name, email, password) => api('/api/auth/signup', { method: 'POST', body: { name, email, password } }),
   login: (email, password) => api('/api/auth/login', { method: 'POST', body: { email, password } }),
   logout: () => api('/api/auth/logout', { method: 'POST' }),
+  googleSignIn: (credential) => api('/api/auth/google', { method: 'POST', body: { credential } }),
   session: () => api('/api/auth/session'),
 
   // ---- Admin ----
