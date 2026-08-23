@@ -911,7 +911,6 @@ function renderHome(){
   const latest = [...STATE.books].sort((a,b)=> new Date(b.releaseDate)-new Date(a.releaseDate)).slice(0,3);
   return `
   <section class="hero">
-    <div class="hero-bg-photo" style="background-image:url(${IMG_hero_bg});"></div>
     <div class="hero-bg-overlay"></div>
     <div class="rays"></div>
     <div class="container hero-grid">
