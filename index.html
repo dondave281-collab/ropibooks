@@ -1683,10 +1683,13 @@ async function handleNewsletterSubmit(e){
   e.preventDefault();
   const email = document.getElementById('nl-email').value.trim().toLowerCase();
   if(!email) return false;
-  const list = await getSubscribers();
-  if(!list.includes(email)){ list.push(email); await storeSet('subscribers:list', list, true); }
-  showToast('Subscribed! Thank you for joining.');
-  document.getElementById('nl-email').value='';
+  try{
+    await API.subscribe(email);
+    showToast('Subscribed! Thank you for joining.');
+    document.getElementById('nl-email').value='';
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
   return false;
 }
 function openContactModal(){
@@ -1707,11 +1710,13 @@ async function submitContact(e){
   const name = document.getElementById('ct-name').value.trim();
   const email = document.getElementById('ct-email').value.trim();
   const message = document.getElementById('ct-msg').value.trim();
-  const list = await getMessages();
-  list.push({name,email,message,date:new Date().toISOString()});
-  await storeSet('contact:messages', list, true);
-  closeModal();
-  showToast('Message sent — thank you!');
+  try{
+    await API.sendMessage(name, email, message);
+    closeModal();
+    showToast('Message sent — thank you!');
+  }catch(err){
+    showToast(err.message, '⚠️');
+  }
   return false;
 }
 
