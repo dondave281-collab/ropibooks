@@ -4,19 +4,34 @@ const { notifyAdmin } = require('../_lib/mailer');
 const { ok, fail, requireUser, requireAdmin, withHandler } = require('../_lib/util');
 
 const HUBTEL_INITIATE_URL = 'https://payproxyapi.hubtel.com/items/initiate';
+const HUBTEL_STATUS_BASE = 'https://rmsc.hubtel.com/v1/merchantaccount/merchants';
 
 function siteUrl() {
   return String(process.env.SITE_URL || 'https://www.ropibooks.com').replace(/\/$/, '');
 }
 
 // The callback URL is fixed and public, so it cannot prove a callback is genuine on its own.
-// Instead each payment gets a secret, unguessable gateway_ref (sent to Hubtel as clientReference).
+// Each payment gets a secret, unguessable gateway_ref (sent to Hubtel as clientReference).
 // Customers only ever see the public order_ref, so they cannot forge a callback for their order.
 const GATEWAY_REF_RE = /^[a-f0-9]{32}$/;
 
 function publicOrder(order) {
   const { gateway_ref, paystack_ref, ...safe } = order || {};
   return safe;
+}
+
+function basicAuth() {
+  return 'Basic ' + Buffer.from(`${process.env.HUBTEL_CLIENT_ID || ''}:${process.env.HUBTEL_CLIENT_SECRET || ''}`).toString('base64');
+}
+
+// Hubtel's field casing differs between docs/versions, so read both.
+function pick(obj, ...keys) {
+  for (const k of keys) if (obj && obj[k] !== undefined && obj[k] !== null) return obj[k];
+  return undefined;
+}
+
+function mask(text, secret) {
+  return secret ? String(text).split(secret).join(secret.slice(0, 6) + '…') : String(text);
 }
 
 async function unlockLibrary(order) {
@@ -28,11 +43,85 @@ async function unlockLibrary(order) {
   }
 }
 
-// Hubtel's field casing differs between docs/versions, so read both.
-function pick(obj, ...keys) {
-  for (const k of keys) if (obj && obj[k] !== undefined && obj[k] !== null) return obj[k];
-  return undefined;
+/**
+ * Asks Hubtel directly whether this order was paid (their public transaction status check).
+ * Returns { state }: 'paid' | 'not_paid' | 'mismatch' | 'unknown'.
+ * Anything we can't read clearly is 'unknown' — callers must never treat 'unknown' as paid on their own.
+ */
+async function checkHubtelStatus(order) {
+  const account = process.env.HUBTEL_COLLECTION_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER;
+  if (!account || !process.env.HUBTEL_CLIENT_ID || !process.env.HUBTEL_CLIENT_SECRET || !GATEWAY_REF_RE.test(String(order.gateway_ref || ''))) {
+    return { state: 'unknown' };
+  }
+  const url = `${HUBTEL_STATUS_BASE}/${encodeURIComponent(account)}/transactions/status?clientReference=${encodeURIComponent(order.gateway_ref)}`;
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 8000);
+    let res;
+    try {
+      res = await fetch(url, { method: 'GET', headers: { Authorization: basicAuth(), Accept: 'application/json' }, signal: ctl.signal });
+    } finally { clearTimeout(timer); }
+
+    const text = await res.text();
+    console.log(`Hubtel status check for ${order.order_ref}: HTTP ${res.status}`, mask(text.slice(0, 600), order.gateway_ref));
+    if (!res.ok) return { state: 'unknown' };
+
+    let body;
+    try { body = JSON.parse(text); } catch (e) { return { state: 'unknown' }; }
+    const d = pick(body, 'data', 'Data') || body;
+
+    const echoed = pick(d, 'clientReference', 'ClientReference');
+    if (echoed !== undefined && String(echoed) !== order.gateway_ref) return { state: 'unknown' };
+
+    const status = String(pick(d, 'status', 'Status', 'transactionStatus', 'TransactionStatus') || '').toLowerCase().replace(/\s+/g, '');
+    const PAID = ['paid', 'success', 'successful', 'completed'];
+    const NOT_PAID = ['unpaid', 'failed', 'cancelled', 'canceled', 'expired', 'declined', 'pending', 'processing', 'inprogress', 'refunded'];
+
+    if (PAID.includes(status)) {
+      const amount = pick(d, 'amount', 'Amount', 'transactionAmount', 'TransactionAmount');
+      if (amount !== undefined && Math.abs(Number(amount) - Number(order.total)) > 0.009) {
+        console.error(`Hubtel status amount mismatch for ${order.order_ref}: Hubtel says ${amount}, order is ${order.total}`);
+        return { state: 'mismatch' };
+      }
+      return { state: 'paid', checkoutId: String(pick(d, 'transactionId', 'TransactionId', 'checkoutId', 'CheckoutId') || '') };
+    }
+    if (NOT_PAID.includes(status)) return { state: 'not_paid' };
+    return { state: 'unknown' };
+  } catch (e) {
+    console.error('Hubtel status check failed:', e.message);
+    return { state: 'unknown' };
+  }
 }
+
+// Atomically flips pending -> paid (so concurrent callbacks/checks can't double-process) and unlocks digital books.
+async function settlePaid(order, hubtelRef, how) {
+  const rows = await db.update('orders', `id=eq.${order.id}&status=eq.pending`, {
+    status: 'paid',
+    paystack_ref: hubtelRef || '', // Hubtel's own reference, for reconciliation
+    updated_at: new Date().toISOString(),
+  });
+  await unlockLibrary(order); // idempotent
+  const changed = Array.isArray(rows) && rows.length > 0;
+  if (changed) {
+    notifyAdmin(
+      `Payment confirmed ${order.order_ref} — Restorers of Paths`,
+      `Payment received via Hubtel (${how}).\n\nOrder ref: ${order.order_ref}\nCustomer: ${order.user_name} (${order.user_email})\nAmount: GHS ${order.total}`
+    );
+  }
+  return changed;
+}
+
+// Re-checks a pending Hubtel order with Hubtel itself. Marks it paid only on a clear "paid" answer.
+async function reconcileOrder(order, how) {
+  if (order.status !== 'pending' || order.payment_method !== 'hubtel') return false;
+  const check = await checkHubtelStatus(order);
+  if (check.state !== 'paid') return false;
+  return settlePaid(order, check.checkoutId, how);
+}
+
+const RECHECK_AFTER_MS = 6000;      // customer polling: at most one Hubtel check per order every few seconds
+const ADMIN_RECHECK_AFTER_MS = 60000;
+const RECHECK_WINDOW_MS = 7 * 86400000;
 
 module.exports = withHandler(async (req, res) => {
   const action = req.query.action;
@@ -84,10 +173,8 @@ module.exports = withHandler(async (req, res) => {
 
     if (paymentMethod === 'cod') return ok(res, { order: publicOrder(order) });
 
-    const clientId = process.env.HUBTEL_CLIENT_ID;
-    const clientSecret = process.env.HUBTEL_CLIENT_SECRET;
     const merchantAccountNumber = process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER;
-    if (!clientId || !clientSecret || !merchantAccountNumber) {
+    if (!process.env.HUBTEL_CLIENT_ID || !process.env.HUBTEL_CLIENT_SECRET || !merchantAccountNumber) {
       console.error('Hubtel env vars missing');
       return fail(res, 503, 'Online payment is not available right now. Please choose Cash on Delivery or try again later.');
     }
@@ -95,11 +182,7 @@ module.exports = withHandler(async (req, res) => {
     const base = siteUrl();
     const hubRes = await fetch(HUBTEL_INITIATE_URL, {
       method: 'POST',
-      headers: {
-        Authorization: 'Basic ' + Buffer.from(`${clientId}:${clientSecret}`).toString('base64'),
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
+      headers: { Authorization: basicAuth(), 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
         totalAmount: total,
         description: `Book order ${orderRef}`,
@@ -116,7 +199,7 @@ module.exports = withHandler(async (req, res) => {
 
     const checkoutUrl = hubData && hubData.data && hubData.data.checkoutUrl;
     if (!hubRes.ok || !hubData || String(hubData.responseCode) !== '0000' || !checkoutUrl) {
-      console.error('Hubtel initiate failed:', hubRes.status, JSON.stringify(hubData));
+      console.error('Hubtel initiate failed:', hubRes.status, mask(JSON.stringify(hubData), gatewayRef));
       return fail(res, 502, 'Could not start the payment. Please try again.');
     }
 
@@ -124,49 +207,41 @@ module.exports = withHandler(async (req, res) => {
   }
 
   // Hubtel posts the final payment status here (fixed URL, no login).
-  // A callback is only accepted if it carries the secret gateway_ref of a pending order, and the amount matches.
+  // The callback is only a nudge: we find the order by its secret reference, then ask Hubtel directly.
   if (action === 'hubtel-callback' && req.method === 'POST') {
     const body = req.body || {};
     const data = pick(body, 'Data', 'data') || {};
     const clientRef = String(pick(data, 'ClientReference', 'clientReference') || '');
 
-    // Log the payload for diagnosis, with the secret reference masked.
-    console.log('Hubtel callback received:', JSON.stringify(body).split(clientRef || '\u0000').join(clientRef.slice(0, 6) + '…'));
+    console.log('Hubtel callback received:', mask(JSON.stringify(body), clientRef));
 
     if (!GATEWAY_REF_RE.test(clientRef)) return fail(res, 400, 'Invalid reference.');
 
     const rows = await db.select('orders', `gateway_ref=eq.${clientRef}&select=*`);
     const order = rows[0];
     if (!order) return fail(res, 404, 'Order not found.');
-    const ref = order.order_ref;
     if (order.status !== 'pending') return ok(res, { ok: true }); // already handled (idempotent)
 
     const responseCode = String(pick(body, 'ResponseCode', 'responseCode') || '');
     const status = String(pick(data, 'Status', 'status') || pick(body, 'Status', 'status') || '').toLowerCase();
-    const succeeded = (responseCode === '' || responseCode === '0000') && ['success', 'successful', 'completed', 'paid'].includes(status);
-
-    if (!succeeded) {
-      console.log(`Hubtel callback for ${ref}: not a success (code=${responseCode}, status=${status}); order left pending.`);
-      return ok(res, { ok: true });
-    }
-
+    const callbackSaysPaid = (responseCode === '' || responseCode === '0000') && ['success', 'successful', 'completed', 'paid'].includes(status);
     const paidAmount = pick(data, 'Amount', 'amount');
     if (paidAmount !== undefined && Math.abs(Number(paidAmount) - Number(order.total)) > 0.009) {
-      console.error(`Hubtel amount mismatch for ${ref}: paid ${paidAmount}, expected ${order.total}`);
+      console.error(`Hubtel amount mismatch for ${order.order_ref}: callback says ${paidAmount}, expected ${order.total}`);
       return fail(res, 400, 'Amount mismatch.');
     }
 
-    await db.update('orders', `id=eq.${order.id}`, {
-      status: 'paid',
-      paystack_ref: String(pick(data, 'CheckoutId', 'checkoutId') || ''), // Hubtel's checkout id, for reconciliation
-      updated_at: new Date().toISOString(),
-    });
-    await unlockLibrary(order);
-
-    notifyAdmin(
-      `Payment confirmed ${ref} — Restorers of Paths`,
-      `Payment received via Hubtel.\n\nOrder ref: ${ref}\nCustomer: ${order.user_name} (${order.user_email})\nAmount: GHS ${order.total}`
-    );
+    const check = await checkHubtelStatus(order);
+    if (check.state === 'paid') {
+      await settlePaid(order, check.checkoutId || String(pick(data, 'CheckoutId', 'checkoutId') || ''), 'verified with Hubtel');
+    } else if (check.state === 'unknown' && callbackSaysPaid) {
+      // Hubtel's status service could not be read (down, or an answer in a format we don't recognise).
+      // Fall back to the callback itself: it carried the secret reference and the right amount.
+      console.warn(`Order ${order.order_ref} marked paid from callback WITHOUT Hubtel confirmation (status check unavailable).`);
+      await settlePaid(order, String(pick(data, 'CheckoutId', 'checkoutId') || ''), 'callback — not independently verified');
+    } else {
+      console.log(`Hubtel callback for ${order.order_ref} not accepted as paid (check=${check.state}, callbackSaysPaid=${callbackSaysPaid}); order left pending.`);
+    }
     return ok(res, { ok: true });
   }
 
@@ -175,9 +250,24 @@ module.exports = withHandler(async (req, res) => {
     if (!user) return;
     const ref = String(req.query.reference || '');
     if (!ref) return fail(res, 422, 'reference is required.');
-    const rows = await db.select('orders', `order_ref=eq.${encodeURIComponent(ref)}&user_id=eq.${user.id}&select=id,order_ref,status,total,items,created_at`);
+
+    let rows = await db.select('orders', `order_ref=eq.${encodeURIComponent(ref)}&user_id=eq.${user.id}&select=*`);
     if (!rows.length) return fail(res, 404, 'Order not found.');
-    return ok(res, { order: rows[0] });
+    let order = rows[0];
+
+    // Callback missed or slow? Ask Hubtel ourselves (throttled so polling can't hammer it).
+    if (order.status === 'pending' && order.payment_method === 'hubtel') {
+      const last = order.updated_at ? new Date(order.updated_at).getTime() : 0;
+      if (Date.now() - last >= RECHECK_AFTER_MS) {
+        await db.update('orders', `id=eq.${order.id}&status=eq.pending`, { updated_at: new Date().toISOString() });
+        if (await reconcileOrder(order, 'confirmed on customer return')) {
+          rows = await db.select('orders', `id=eq.${order.id}&select=*`);
+          order = rows[0] || order;
+        }
+      }
+    }
+    const { id, order_ref, status, total, items, created_at } = order;
+    return ok(res, { order: { id, order_ref, status, total, items, created_at } });
   }
 
   // Customer-facing: only that user's own orders, no admin session required.
@@ -191,6 +281,18 @@ module.exports = withHandler(async (req, res) => {
   if (action === 'list' && req.method === 'GET') {
     const admin = await requireAdmin(req, res);
     if (!admin) return;
+
+    // Opening the Orders tab doubles as reconciliation: re-check recent unpaid Hubtel orders with Hubtel.
+    const since = new Date(Date.now() - RECHECK_WINDOW_MS).toISOString();
+    const stale = new Date(Date.now() - ADMIN_RECHECK_AFTER_MS).toISOString();
+    const pending = await db.select('orders', `status=eq.pending&payment_method=eq.hubtel&created_at=gte.${encodeURIComponent(since)}&updated_at=lt.${encodeURIComponent(stale)}&select=*&order=created_at.desc&limit=10`);
+    await Promise.all(pending.map(async (o) => {
+      try {
+        await db.update('orders', `id=eq.${o.id}&status=eq.pending`, { updated_at: new Date().toISOString() });
+        await reconcileOrder(o, 'confirmed on admin refresh');
+      } catch (e) { console.error('reconcile failed for', o.order_ref, e.message); }
+    }));
+
     const orders = await db.select('orders', 'select=id,order_ref,user_id,user_email,user_name,items,total,payment_method,paystack_ref,status,delivery,created_at,updated_at&order=created_at.desc');
     return ok(res, { orders });
   }
@@ -207,7 +309,7 @@ module.exports = withHandler(async (req, res) => {
 
     const rows = await db.update('orders', `id=eq.${encodeURIComponent(orderId)}`, { status, updated_at: new Date().toISOString() });
 
-    // Lets the admin reconcile a payment whose callback never arrived: marking it paid also unlocks the digital books.
+    // Manual override: marking an order paid also unlocks its digital books.
     if (status === 'paid') await unlockLibrary(existing[0]);
 
     return ok(res, { order: rows[0] || null });
