@@ -34,6 +34,39 @@ function mask(text, secret) {
   return secret ? String(text).split(secret).join(secret.slice(0, 6) + '…') : String(text);
 }
 
+// Every callback Hubtel sends is stored permanently (the secret reference is masked), with what we did about it.
+// Logging must never break payment handling, so failures here are swallowed.
+async function logCallback(req, body, clientRef) {
+  try {
+    let text = mask(JSON.stringify(body), clientRef);
+    let payload;
+    try { payload = JSON.parse(text.length > 20000 ? '{}' : text); } catch (e) { payload = { raw: text.slice(0, 20000) }; }
+    const row = await db.insert('hubtel_callbacks', {
+      payload,
+      source_ip: String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || null,
+      user_agent: String(req.headers['user-agent'] || '').slice(0, 255),
+      outcome: 'received',
+    });
+    return row && row.id;
+  } catch (e) {
+    console.error('callback log failed:', e.message);
+    return null;
+  }
+}
+
+async function finishCallbackLog(id, outcome, note, order) {
+  if (!id) return;
+  try {
+    await db.update('hubtel_callbacks', `id=eq.${id}`, {
+      outcome,
+      note: note ? String(note).slice(0, 500) : null,
+      order_ref: order ? order.order_ref : null,
+    });
+  } catch (e) {
+    console.error('callback log update failed:', e.message);
+  }
+}
+
 async function unlockLibrary(order) {
   if (!order.user_id) return;
   for (const item of order.items || []) {
@@ -214,13 +247,23 @@ module.exports = withHandler(async (req, res) => {
     const clientRef = String(pick(data, 'ClientReference', 'clientReference') || '');
 
     console.log('Hubtel callback received:', mask(JSON.stringify(body), clientRef));
+    const logId = await logCallback(req, body, clientRef); // stored before anything can reject it
 
-    if (!GATEWAY_REF_RE.test(clientRef)) return fail(res, 400, 'Invalid reference.');
+    if (!GATEWAY_REF_RE.test(clientRef)) {
+      await finishCallbackLog(logId, 'rejected_invalid_reference', 'ClientReference missing or malformed');
+      return fail(res, 400, 'Invalid reference.');
+    }
 
     const rows = await db.select('orders', `gateway_ref=eq.${clientRef}&select=*`);
     const order = rows[0];
-    if (!order) return fail(res, 404, 'Order not found.');
-    if (order.status !== 'pending') return ok(res, { ok: true }); // already handled (idempotent)
+    if (!order) {
+      await finishCallbackLog(logId, 'rejected_unknown_reference', 'No order has this reference');
+      return fail(res, 404, 'Order not found.');
+    }
+    if (order.status !== 'pending') {
+      await finishCallbackLog(logId, 'ignored_already_processed', `Order already ${order.status}`, order);
+      return ok(res, { ok: true }); // already handled (idempotent)
+    }
 
     const responseCode = String(pick(body, 'ResponseCode', 'responseCode') || '');
     const status = String(pick(data, 'Status', 'status') || pick(body, 'Status', 'status') || '').toLowerCase();
@@ -228,19 +271,23 @@ module.exports = withHandler(async (req, res) => {
     const paidAmount = pick(data, 'Amount', 'amount');
     if (paidAmount !== undefined && Math.abs(Number(paidAmount) - Number(order.total)) > 0.009) {
       console.error(`Hubtel amount mismatch for ${order.order_ref}: callback says ${paidAmount}, expected ${order.total}`);
+      await finishCallbackLog(logId, 'rejected_amount_mismatch', `Callback amount ${paidAmount}, order total ${order.total}`, order);
       return fail(res, 400, 'Amount mismatch.');
     }
 
     const check = await checkHubtelStatus(order);
     if (check.state === 'paid') {
       await settlePaid(order, check.checkoutId || String(pick(data, 'CheckoutId', 'checkoutId') || ''), 'verified with Hubtel');
+      await finishCallbackLog(logId, 'paid_verified', 'Hubtel status check confirmed payment', order);
     } else if (check.state === 'unknown' && callbackSaysPaid) {
       // Hubtel's status service could not be read (down, or an answer in a format we don't recognise).
       // Fall back to the callback itself: it carried the secret reference and the right amount.
       console.warn(`Order ${order.order_ref} marked paid from callback WITHOUT Hubtel confirmation (status check unavailable).`);
       await settlePaid(order, String(pick(data, 'CheckoutId', 'checkoutId') || ''), 'callback — not independently verified');
+      await finishCallbackLog(logId, 'paid_unverified', 'Status check unavailable; accepted callback (secret reference + amount matched)', order);
     } else {
       console.log(`Hubtel callback for ${order.order_ref} not accepted as paid (check=${check.state}, callbackSaysPaid=${callbackSaysPaid}); order left pending.`);
+      await finishCallbackLog(logId, 'not_accepted', `Status check: ${check.state}; callback says paid: ${callbackSaysPaid}`, order);
     }
     return ok(res, { ok: true });
   }
