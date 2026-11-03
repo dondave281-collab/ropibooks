@@ -833,8 +833,12 @@ async function initData(){
 
 async function loadLibrary(){
   if(!STATE.user) { STATE.library = []; return; }
-  const lib = await storeGet('userlib:'+STATE.user.email, true);
-  STATE.library = lib || [];
+  try{
+    const { library } = await API.myLibrary();
+    STATE.library = (library || []).map(r=>({ bookId:r.book_id, purchasedAt:r.purchased_at }));
+  }catch(err){
+    STATE.library = [];
+  }
 }
 
 async function saveLibrary(){
@@ -1432,9 +1436,10 @@ async function finishSignIn(user){
   render();
 }
 function signOut(){
+  API.logout().catch(()=>{});   // revoke the session on the server (token is read before it is cleared below)
+  setAuthToken(null);           // forget the sign-in on this device, so a refresh does not sign the user back in
   STATE.user = null;
   STATE.library = [];
-  storeDelete('session:current', false);
   closeModal();
   showToast('Signed out');
   go('home');
