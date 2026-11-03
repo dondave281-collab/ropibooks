@@ -76,54 +76,64 @@ async function unlockLibrary(order) {
   }
 }
 
-/**
- * Asks Hubtel directly whether this order was paid (their public transaction status check).
- * Returns { state }: 'paid' | 'not_paid' | 'mismatch' | 'unknown'.
- * Anything we can't read clearly is 'unknown' — callers must never treat 'unknown' as paid on their own.
- */
-async function checkHubtelStatus(order) {
-  const account = process.env.HUBTEL_COLLECTION_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER;
+function hubtelAccountNumber() {
+  return process.env.HUBTEL_COLLECTION_ACCOUNT_NUMBER || process.env.HUBTEL_MERCHANT_ACCOUNT_NUMBER;
+}
+
+// Calls Hubtel's public transaction status check. Returns the raw outcome; nothing is interpreted here.
+async function fetchHubtelStatus(order) {
+  const account = hubtelAccountNumber();
   if (!account || !process.env.HUBTEL_CLIENT_ID || !process.env.HUBTEL_CLIENT_SECRET || !GATEWAY_REF_RE.test(String(order.gateway_ref || ''))) {
-    return { state: 'unknown' };
+    return { configured: false };
   }
   const url = `${HUBTEL_STATUS_BASE}/${encodeURIComponent(account)}/transactions/status?clientReference=${encodeURIComponent(order.gateway_ref)}`;
   try {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), 8000);
-    let res;
     try {
-      res = await fetch(url, { method: 'GET', headers: { Authorization: basicAuth(), Accept: 'application/json' }, signal: ctl.signal });
+      const res = await fetch(url, { method: 'GET', headers: { Authorization: basicAuth(), Accept: 'application/json' }, signal: ctl.signal });
+      return { configured: true, url, httpStatus: res.status, ok: res.ok, text: await res.text() };
     } finally { clearTimeout(timer); }
-
-    const text = await res.text();
-    console.log(`Hubtel status check for ${order.order_ref}: HTTP ${res.status}`, mask(text.slice(0, 600), order.gateway_ref));
-    if (!res.ok) return { state: 'unknown' };
-
-    let body;
-    try { body = JSON.parse(text); } catch (e) { return { state: 'unknown' }; }
-    const d = pick(body, 'data', 'Data') || body;
-
-    const echoed = pick(d, 'clientReference', 'ClientReference');
-    if (echoed !== undefined && String(echoed) !== order.gateway_ref) return { state: 'unknown' };
-
-    const status = String(pick(d, 'status', 'Status', 'transactionStatus', 'TransactionStatus') || '').toLowerCase().replace(/\s+/g, '');
-    const PAID = ['paid', 'success', 'successful', 'completed'];
-    const NOT_PAID = ['unpaid', 'failed', 'cancelled', 'canceled', 'expired', 'declined', 'pending', 'processing', 'inprogress', 'refunded'];
-
-    if (PAID.includes(status)) {
-      const amount = pick(d, 'amount', 'Amount', 'transactionAmount', 'TransactionAmount');
-      if (amount !== undefined && Math.abs(Number(amount) - Number(order.total)) > 0.009) {
-        console.error(`Hubtel status amount mismatch for ${order.order_ref}: Hubtel says ${amount}, order is ${order.total}`);
-        return { state: 'mismatch' };
-      }
-      return { state: 'paid', checkoutId: String(pick(d, 'transactionId', 'TransactionId', 'checkoutId', 'CheckoutId') || '') };
-    }
-    if (NOT_PAID.includes(status)) return { state: 'not_paid' };
-    return { state: 'unknown' };
   } catch (e) {
-    console.error('Hubtel status check failed:', e.message);
-    return { state: 'unknown' };
+    return { configured: true, url, error: e.message };
   }
+}
+
+// Turns Hubtel's reply into: 'paid' | 'not_paid' | 'mismatch' | 'unknown' (+ a plain-English reason).
+// Anything we can't read clearly is 'unknown' — callers must never treat 'unknown' as paid on their own.
+function interpretHubtelStatus(order, text) {
+  let body;
+  try { body = JSON.parse(text); } catch (e) { return { state: 'unknown', reason: 'Reply was not valid JSON' }; }
+  const d = pick(body, 'data', 'Data') || body;
+
+  const echoed = pick(d, 'clientReference', 'ClientReference');
+  if (echoed !== undefined && String(echoed) !== order.gateway_ref) return { state: 'unknown', reason: 'Reply is for a different reference' };
+
+  const rawStatus = String(pick(d, 'status', 'Status', 'transactionStatus', 'TransactionStatus') || '');
+  const status = rawStatus.toLowerCase().replace(/\s+/g, '');
+  const PAID = ['paid', 'success', 'successful', 'completed'];
+  const NOT_PAID = ['unpaid', 'failed', 'cancelled', 'canceled', 'expired', 'declined', 'pending', 'processing', 'inprogress', 'refunded'];
+
+  if (PAID.includes(status)) {
+    const amount = pick(d, 'amount', 'Amount', 'transactionAmount', 'TransactionAmount');
+    if (amount !== undefined && Math.abs(Number(amount) - Number(order.total)) > 0.009) {
+      return { state: 'mismatch', reason: `Hubtel says the amount is ${amount} but the order total is ${order.total}` };
+    }
+    return { state: 'paid', reason: 'Hubtel reports the payment as paid', checkoutId: String(pick(d, 'transactionId', 'TransactionId', 'checkoutId', 'CheckoutId') || '') };
+  }
+  if (NOT_PAID.includes(status)) return { state: 'not_paid', reason: `Hubtel reports status "${rawStatus}"` };
+  return { state: 'unknown', reason: rawStatus ? `Unrecognised status "${rawStatus}"` : 'No status field found in the reply' };
+}
+
+async function checkHubtelStatus(order) {
+  const f = await fetchHubtelStatus(order);
+  if (!f.configured) return { state: 'unknown' };
+  if (f.error) { console.error('Hubtel status check failed:', f.error); return { state: 'unknown' }; }
+  console.log(`Hubtel status check for ${order.order_ref}: HTTP ${f.httpStatus}`, mask(String(f.text).slice(0, 600), order.gateway_ref));
+  if (!f.ok) return { state: 'unknown' };
+  const r = interpretHubtelStatus(order, f.text);
+  if (r.state === 'mismatch') console.error(`Hubtel status amount mismatch for ${order.order_ref}: ${r.reason}`);
+  return r;
 }
 
 // Atomically flips pending -> paid (so concurrent callbacks/checks can't double-process) and unlocks digital books.
@@ -342,6 +352,42 @@ module.exports = withHandler(async (req, res) => {
 
     const orders = await db.select('orders', 'select=id,order_ref,user_id,user_email,user_name,items,total,payment_method,paystack_ref,status,delivery,created_at,updated_at&order=created_at.desc');
     return ok(res, { orders });
+  }
+
+  // Admin-only, read-only: shows exactly what Hubtel says about one order, and what the site made of it.
+  if (action === 'diagnose' && req.method === 'GET') {
+    const admin = await requireAdmin(req, res);
+    if (!admin) return;
+    const ref = String(req.query.ref || '').trim();
+    if (!ref) return fail(res, 422, 'Add ?ref=ROP-XXXXXXXXXX (the order number).');
+
+    const rows = await db.select('orders', `order_ref=eq.${encodeURIComponent(ref)}&select=*`);
+    const order = rows[0];
+    if (!order) return fail(res, 404, 'No order with that number.');
+
+    const f = await fetchHubtelStatus(order);
+    const interpreted = f.configured && !f.error && f.ok ? interpretHubtelStatus(order, f.text) : null;
+    const callbacks = await db.select('hubtel_callbacks', `order_ref=eq.${encodeURIComponent(ref)}&select=received_at,outcome,note,payload&order=received_at.desc&limit=5`);
+
+    return ok(res, {
+      order: { order_ref: order.order_ref, status: order.status, total: order.total, payment_method: order.payment_method, has_gateway_ref: !!order.gateway_ref, created_at: order.created_at, updated_at: order.updated_at },
+      setup: {
+        keys_present: !!(process.env.HUBTEL_CLIENT_ID && process.env.HUBTEL_CLIENT_SECRET),
+        account_number_used: hubtelAccountNumber() || null,
+        using_separate_collection_account: !!process.env.HUBTEL_COLLECTION_ACCOUNT_NUMBER,
+        site_url: siteUrl(),
+      },
+      hubtel_status_check: !f.configured
+        ? { problem: 'Not configured: missing API keys / account number, or this order has no payment reference (placed before the update, or cash on delivery).' }
+        : {
+            url: mask(f.url, order.gateway_ref),
+            http_status: f.httpStatus || null,
+            network_error: f.error || null,
+            reply: f.text ? mask(String(f.text).slice(0, 1500), order.gateway_ref) : null,
+          },
+      site_reads_it_as: interpreted,
+      recent_callbacks: callbacks,
+    });
   }
 
   if (action === 'update-status' && req.method === 'POST') {
