@@ -1,6 +1,10 @@
 const db = require('../_lib/supabase');
 const { ok, fail, requireUser, withHandler } = require('../_lib/util');
 
+// A physical copy shows in the customer's library only after the admin has confirmed it by setting the
+// order to this status in the admin Orders tab. Change this one word to use a different status.
+const PHYSICAL_CONFIRMED_STATUS = 'delivered';
+
 module.exports = withHandler(async (req, res) => {
   const action = req.query.action;
 
@@ -8,7 +12,19 @@ module.exports = withHandler(async (req, res) => {
     const user = await requireUser(req, res);
     if (!user) return;
     const rows = await db.select('library', `user_id=eq.${user.id}&select=book_id,purchased_at,books(id,title,cover_url)`);
-    return ok(res, { library: rows });
+
+    // Physical copies come straight from the customer's admin-confirmed orders, so if the admin later
+    // changes an order away from the confirmed status, its books disappear from the library again.
+    const confirmed = await db.select('orders', `user_id=eq.${user.id}&status=eq.${PHYSICAL_CONFIRMED_STATUS}&select=order_ref,items,updated_at&order=updated_at.desc`);
+    const physical = [];
+    for (const o of confirmed) {
+      for (const item of o.items || []) {
+        if (item.format === 'physical') {
+          physical.push({ bookId: item.bookId, title: item.title, qty: item.qty || 1, order_ref: o.order_ref, confirmedAt: o.updated_at });
+        }
+      }
+    }
+    return ok(res, { library: rows, physical });
   }
 
   if (action === 'pdf-url' && req.method === 'GET') {
